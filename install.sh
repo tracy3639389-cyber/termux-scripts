@@ -7,50 +7,45 @@ RESET='\033[0m'
 
 clear
 echo -e "${CYAN}========================================${RESET}"
-echo -e "${GREEN}    Tracy Server 一键安装助手 v1.2    ${RESET}"
+echo -e "${GREEN}    Tracy Server 一键安装助手 v1.3    ${RESET}"
 echo -e "${CYAN}========================================${RESET}"
-echo -e "${YELLOW}正在初始化环境...${RESET}"
-echo ""
 
-# 【修改点】删除了 termux-change-repo，使用默认源更稳
-# 尝试修复源并更新
+# 1. 强制更新源和软件
+echo -e "${YELLOW}正在更新系统组件...${RESET}"
 pkg update -y
 
-# 安装 Node.js 和 wget
-if ! command -v node &> /dev/null; then
-    echo -e "${GREEN}正在安装 Node.js...${RESET}"
-    pkg install nodejs -y
-fi
+# 2. 强制安装 Node.js (不再跳过)
+echo -e "${GREEN}正在安装核心引擎 (Node.js)...${RESET}"
+pkg install nodejs -y
 
-if ! command -v wget &> /dev/null; then
-    echo -e "${GREEN}正在安装下载工具...${RESET}"
-    pkg install wget -y
-fi
+# 3. 强制安装 wget (如果缺失)
+pkg install wget -y
 
-# 下载代码
-echo -e "${GREEN}正在下载 Tracy Server...${RESET}"
+# 4. 下载代码
+echo -e "${GREEN}正在下载服务器代码...${RESET}"
+rm -f $HOME/server.js # 删除旧的，确保下载新的
 wget -O $HOME/server.js https://raw.githubusercontent.com/tracy3639389-cyber/termux-scripts/main/server.js
 
-# 安装依赖
-echo -e "${GREEN}正在安装依赖库...${RESET}"
+# 5. 安装依赖 (使用淘宝源加速)
+echo -e "${GREEN}正在配置运行环境...${RESET}"
 cd $HOME
-# 使用淘宝镜像加速 npm 安装
 npm config set registry https://registry.npmmirror.com/
 npm install express ws
 
-# 设置快捷指令
+# 6. 设置 run 快捷键
 sed -i '/alias run=/d' $HOME/.bashrc
 echo "alias run='node ~/server.js'" >> $HOME/.bashrc
-source $HOME/.bashrc
 
-# 设置桌面小组件
+# 7. 设置桌面小组件
 mkdir -p $HOME/.shortcuts
 echo "node ~/server.js" > $HOME/.shortcuts/TracyServer
 chmod +x $HOME/.shortcuts/TracyServer
 
 clear
-echo -e "${GREEN}安装完成！${RESET}"
-echo -e "输入 ${YELLOW}run${RESET} 启动服务。"
+echo -e "${CYAN}========================================${RESET}"
+echo -e "${GREEN}      安装成功！      ${RESET}"
+echo -e "${CYAN}========================================${RESET}"
+echo -e "请务必执行以下操作："
+echo -e "1. ${YELLOW}重启 Termux${RESET} (彻底关闭后台再打开)"
+echo -e "2. 输入 ${YELLOW}run${RESET} 即可启动"
 echo ""
-sleep 2
-node ~/server.js
