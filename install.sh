@@ -32,9 +32,18 @@ cd $HOME
 npm config set registry https://registry.npmmirror.com/
 npm install express ws
 
-# 6. 设置 run 快捷键
-sed -i '/alias run=/d' $HOME/.bashrc
+# 6. 设置 run 快捷键 (同时兼容 Bash 和 Zsh)
+# 先清理旧的
+sed -i '/alias run=/d' $HOME/.bashrc 2>/dev/null
+sed -i '/alias run=/d' $HOME/.zshrc 2>/dev/null
+
+# 写入 Bash 配置
 echo "alias run='node ~/server.js'" >> $HOME/.bashrc
+
+# 检测如果是 Zsh 用户，也写入 Zsh 配置
+if [ -f "$HOME/.zshrc" ]; then
+    echo "alias run='node ~/server.js'" >> $HOME/.zshrc
+fi
 
 # 7. 设置桌面小组件
 mkdir -p $HOME/.shortcuts
