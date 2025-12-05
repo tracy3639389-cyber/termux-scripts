@@ -10,4 +10,4 @@ build中转服务器代码
 2. 打开 Termux，复制下面这行命令，粘贴并回车：
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/tracy3639389-cyber/termux-scripts/main/install.sh)
+bash <(curl -s https://cdn.jsdelivr.net/gh/tracy3639389-cyber/termux-scripts@main/install.sh)
