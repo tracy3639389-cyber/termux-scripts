@@ -31,7 +31,7 @@ fi
 # 3. 下载你的服务器代码
 echo -e "${GREEN}正在下载 Tracy Server 核心代码...${RESET}"
 # 强制覆盖下载，确保是最新版
-wget -O $HOME/server.js https://raw.githubusercontent.com/tracy3639389-cyber/termux-scripts/main/server.js
+wget -O $HOME/server.js https://cdn.jsdelivr.net/gh/tracy3639389-cyber/termux-scripts@main/server.js
 
 # 【重要修复】 4. 安装依赖库 (express 和 ws)
 echo -e "${GREEN}正在安装必要的依赖库...${RESET}"
