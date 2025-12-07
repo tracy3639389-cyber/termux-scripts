@@ -1,6 +1,7 @@
 /**
- * TRACY SERVER - Build 1.0
- * Optimized for Termux
+ * TRACY SERVER - Build 1.1 (Fixed)
+ * Optimized for Termux & Cloudflare Tunnel
+ * Fixes: Safety Settings, Stream Detection, Timeout Issues
  */
 
 const express = require('express');
@@ -24,22 +25,19 @@ const C = {
   WHITE: "\x1b[37m",
 };
 
-// 绘制文本边框的辅助函数
 function drawBanner(httpPort, wsPort) {
   console.clear();
   const width = 50;
   const line = "═".repeat(width);
   const space = " ".repeat(width);
-  
   const center = (text) => {
     const pad = Math.floor((width - text.length) / 2);
     return " ".repeat(pad) + text + " ".repeat(width - text.length - pad);
   };
-
   console.log(`${C.CYAN}╔${line}╗`);
   console.log(`║${space}║`);
   console.log(`║${C.BRIGHT}${C.MAGENTA}${center("TRACY SERVER")}${C.CYAN}║`);
-  console.log(`║${C.RESET}${C.DIM}${center("Build 1.0")}${C.CYAN}║`);
+  console.log(`║${C.RESET}${C.DIM}${center("Build 1.1 (Fixed)")}${C.CYAN}║`);
   console.log(`║${space}║`);
   console.log(`╠${line}╣`);
   console.log(`║${space}║`);
@@ -52,15 +50,12 @@ function drawBanner(httpPort, wsPort) {
 // ==========================================
 // 基础服务类
 // ==========================================
-
 class LoggingService {
   constructor(serviceName = 'System') { this.serviceName = serviceName; }
-  
   _log(level, color, message) { 
     const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     console.log(`${C.DIM}[${timestamp}]${C.RESET} ${color}[${level}]${C.RESET} ${message}`);
   }
-
   info(message) { this._log('INFO', C.GREEN, message); }
   error(message) { this._log('ERR ', C.RED, message); }
   warn(message) { this._log('WARN', C.YELLOW, message); }
@@ -95,7 +90,6 @@ class ConnectionRegistry extends EventEmitter {
   addConnection(websocket, clientInfo) {
     this.connections.add(websocket);
     this.logger.info(`Web端已接入 | IP: ${clientInfo.address} | 在线: ${this.connections.size}`);
-    
     websocket.on('message', (data) => { this._handleIncomingMessage(data.toString()); });
     websocket.on('close', () => { this._removeConnection(websocket); });
     websocket.on('error', (error) => { this.logger.error(`WS连接错误: ${error.message}`); });
@@ -134,7 +128,7 @@ class ConnectionRegistry extends EventEmitter {
 }
 
 // ==========================================
-// 请求处理器 (核心逻辑)
+// 请求处理器 (核心逻辑 - 已修复)
 // ==========================================
 
 class RequestHandler {
@@ -165,6 +159,7 @@ class RequestHandler {
     }
   }
 
+  // 🛡️ 修复1：强行注入安全设置 (BLOCK_NONE)
   _buildProxyRequest(req, requestId) {
     let requestBody = '';
     if (req.body && Object.keys(req.body).length > 0) {
@@ -173,6 +168,16 @@ class RequestHandler {
         bodyObject = typeof req.body === 'object' && !Buffer.isBuffer(req.body)
           ? { ...req.body }
           : JSON.parse(req.body.toString());
+
+        // 注入安全设置，防止 400 错误
+        bodyObject.safetySettings = [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
+        ];
+
         if (bodyObject.hasOwnProperty('stream')) { delete bodyObject.stream; }
         requestBody = JSON.stringify(bodyObject);
       } catch (e) {
@@ -190,6 +195,7 @@ class RequestHandler {
     connection.send(JSON.stringify(proxyRequest));
   }
 
+  // 🛡️ 修复2：改进流式检测逻辑，防止 100秒超时
   async _handleResponse(messageQueue, res, req) {
     const headerMessage = await messageQueue.dequeue();
 
@@ -199,11 +205,19 @@ class RequestHandler {
 
     let isStreaming = false;
     try {
+      // 检测1: 检查 Body 里的 stream 参数
       if (req.body) {
         const body = typeof req.body === 'object' ? req.body : JSON.parse(req.body.toString());
         isStreaming = body.stream === true;
       }
-    } catch (e) { /* ignore */ }
+      // 检测2: 检查 URL 路径里是否包含 stream (针对 Gemini 协议)
+      if (!isStreaming) {
+        isStreaming = req.path.toLowerCase().includes('stream');
+      }
+    } catch (e) { 
+        // 兜底: 如果解析失败，看路径就行
+        isStreaming = req.path.toLowerCase().includes('stream');
+    }
 
     if (isStreaming) {
       this.logger.info(`模式: ${C.CYAN}流式(Stream)${C.RESET} | 路径: ${req.path}`);
@@ -226,6 +240,11 @@ class RequestHandler {
   }
 
   async _streamResponseData(messageQueue, res) {
+    // 强制设置流式头，防止客户端不认
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
     while (true) {
       try {
         const dataMessage = await messageQueue.dequeue();
@@ -233,9 +252,7 @@ class RequestHandler {
         if (dataMessage.data) res.write(dataMessage.data);
       } catch (error) {
         if (error.message === 'Queue timeout') {
-          if ((res.get('Content-Type') || '').includes('text/event-stream')) {
             res.write(': keepalive\n\n');
-          } else { break; }
         } else { throw error; }
       }
     }
@@ -252,7 +269,6 @@ class RequestHandler {
     }
   }
 
-  // 将 Gemini 格式转换为 OpenAI 格式
   _transformGeminiToOpenAI(geminiResponse) {
     const candidates = geminiResponse.candidates || [];
     const choices = candidates.map((candidate, index) => {
@@ -330,7 +346,6 @@ class RequestHandler {
 // ==========================================
 // 主系统类
 // ==========================================
-
 class ProxyServerSystem extends EventEmitter {
   constructor(config = {}) {
     super(); 
@@ -354,8 +369,6 @@ class ProxyServerSystem extends EventEmitter {
 
   async _startHttpServer() {
     const app = express();
-    
-    // CORS & Headers
     app.use((req, res, next) => {
       res.header('Access-Control-Allow-Origin', '*');
       res.header('Access-Control-Allow-Methods', '*');
@@ -368,14 +381,13 @@ class ProxyServerSystem extends EventEmitter {
     app.use(express.urlencoded({ extended: true, limit: '100mb' }));
     app.use(express.raw({ limit: '100mb', type: '*/*' }));
     
-    // 模型列表接口
+    // 模型列表接口 (Mock)
     const modelsHandler = (req, res) => { 
       res.json({ "models": [{ "name": "gemini-3-pro-preview", "displayName": "gemini-3-pro-preview", "version": "Tracy" }] }); 
     };
     app.get('/v1beta/models', modelsHandler); 
     app.get('/models', modelsHandler);
     
-    // 捕获所有其他请求
     app.all(/(.*)/, (req, res) => this.requestHandler.processRequest(req, res));
     
     this.httpServer = http.createServer(app);
@@ -390,12 +402,7 @@ class ProxyServerSystem extends EventEmitter {
   }
 }
 
-// ==========================================
-// 启动入口
-// ==========================================
-
 if (require.main === module) { 
   new ProxyServerSystem().start(); 
 }
-
 module.exports = { ProxyServerSystem };
