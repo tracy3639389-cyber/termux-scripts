@@ -1,7 +1,7 @@
 /**
- * TRACY SERVER - Build 1.1 (Fixed)
- * Optimized for Termux & Cloudflare Tunnel
- * Fixes: Safety Settings, Stream Detection, Timeout Issues
+ * 🌸 TRACY SERVER - Sakura Edition 🌸
+ * Build 1.6 | 纯净 Pro 版
+ * Fixed: 剔除 Chatbox 工具箱参数 (tools), 保持真实模型名, 修复 400 报错
  */
 
 const express = require('express');
@@ -10,399 +10,178 @@ const http = require('http');
 const { EventEmitter } = require('events');
 
 // ==========================================
-// 界面与颜色配置 (UI & Colors)
+// 🎨 调色板
 // ==========================================
 const C = {
-  RESET: "\x1b[0m",
-  BRIGHT: "\x1b[1m",
-  DIM: "\x1b[2m",
-  RED: "\x1b[31m",
-  GREEN: "\x1b[32m",
-  YELLOW: "\x1b[33m",
-  BLUE: "\x1b[34m",
-  MAGENTA: "\x1b[35m",
-  CYAN: "\x1b[36m",
-  WHITE: "\x1b[37m",
+  RESET: "\x1b[0m", PINK: "\x1b[38;5;213m", PURPLE: "\x1b[38;5;141m", 
+  CYAN: "\x1b[38;5;117m", YELLOW: "\x1b[38;5;228m", GRAY: "\x1b[90m"
 };
 
 function drawBanner(httpPort, wsPort) {
   console.clear();
-  const width = 50;
-  const line = "═".repeat(width);
-  const space = " ".repeat(width);
-  const center = (text) => {
-    const pad = Math.floor((width - text.length) / 2);
-    return " ".repeat(pad) + text + " ".repeat(width - text.length - pad);
-  };
-  console.log(`${C.CYAN}╔${line}╗`);
-  console.log(`║${space}║`);
-  console.log(`║${C.BRIGHT}${C.MAGENTA}${center("TRACY SERVER")}${C.CYAN}║`);
-  console.log(`║${C.RESET}${C.DIM}${center("Build 1.1 (Fixed)")}${C.CYAN}║`);
-  console.log(`║${space}║`);
-  console.log(`╠${line}╣`);
-  console.log(`║${space}║`);
-  console.log(`║${C.GREEN}   HTTP Port : ${C.WHITE}${httpPort.toString().padEnd(31)}${C.CYAN}║`);
-  console.log(`║${C.YELLOW}   WS Port   : ${C.WHITE}${wsPort.toString().padEnd(31)}${C.CYAN}║`);
-  console.log(`║${space}║`);
-  console.log(`╚${line}╝${C.RESET}\n`);
+  console.log(`${C.PINK}╭──────────────────────────────────────────────────╮${C.RESET}`);
+  console.log(`${C.PINK}│   ${C.PURPLE}✨ TRACY SERVER v1.6 (Pure Proxy)${C.PINK}            │${C.RESET}`);
+  console.log(`${C.PINK}│   ${C.CYAN}💎 真实模型透传 | 🚫 自动剔除 Tools/联网参数${C.PINK}   │${C.RESET}`);
+  console.log(`${C.PINK}╰──────────────────────────────────────────────────╯${C.RESET}`);
+  console.log(`${C.GRAY}HTTP: ${httpPort} | WS: ${wsPort}${C.RESET}\n`);
 }
 
 // ==========================================
-// 基础服务类
+// 🚀 核心请求处理 (修改重点)
 // ==========================================
-class LoggingService {
-  constructor(serviceName = 'System') { this.serviceName = serviceName; }
-  _log(level, color, message) { 
-    const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-    console.log(`${C.DIM}[${timestamp}]${C.RESET} ${color}[${level}]${C.RESET} ${message}`);
-  }
-  info(message) { this._log('INFO', C.GREEN, message); }
-  error(message) { this._log('ERR ', C.RED, message); }
-  warn(message) { this._log('WARN', C.YELLOW, message); }
-  debug(message) { this._log('DBUG', C.BLUE, message); }
-  req(method, path, ip) {
-    const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-    console.log(`${C.DIM}[${timestamp}]${C.RESET} ${C.MAGENTA}[REQ ]${C.RESET} ${C.BRIGHT}${method}${C.RESET} ${path} ${C.DIM}from ${ip}${C.RESET}`);
-  }
-}
-
-class MessageQueue extends EventEmitter {
-  constructor(timeoutMs = 600000) { super(); this.messages = []; this.waitingResolvers = []; this.defaultTimeout = timeoutMs; this.closed = false; }
-  enqueue(message) { if (this.closed) return; if (this.waitingResolvers.length > 0) { this.waitingResolvers.shift().resolve(message); } else { this.messages.push(message); } }
-  async dequeue(timeoutMs = this.defaultTimeout) {
-    if (this.closed) { throw new Error('Queue is closed'); }
-    return new Promise((resolve, reject) => {
-      if (this.messages.length > 0) { resolve(this.messages.shift()); return; }
-      const resolver = { resolve, reject }; this.waitingResolvers.push(resolver);
-      const timeoutId = setTimeout(() => {
-        const index = this.waitingResolvers.indexOf(resolver);
-        if (index !== -1) { this.waitingResolvers.splice(index, 1); reject(new Error('Queue timeout')); }
-      }, timeoutMs);
-      resolver.timeoutId = timeoutId;
-    });
-  }
-  close() { this.closed = true; this.waitingResolvers.forEach(resolver => { clearTimeout(resolver.timeoutId); resolver.reject(new Error('Queue closed')); }); this.waitingResolvers = []; this.messages = []; }
-}
-
-class ConnectionRegistry extends EventEmitter {
-  constructor(logger) { super(); this.logger = logger; this.connections = new Set(); this.messageQueues = new Map(); }
-  
-  addConnection(websocket, clientInfo) {
-    this.connections.add(websocket);
-    this.logger.info(`Web端已接入 | IP: ${clientInfo.address} | 在线: ${this.connections.size}`);
-    websocket.on('message', (data) => { this._handleIncomingMessage(data.toString()); });
-    websocket.on('close', () => { this._removeConnection(websocket); });
-    websocket.on('error', (error) => { this.logger.error(`WS连接错误: ${error.message}`); });
-    this.emit('connectionAdded', websocket);
-  }
-
-  _removeConnection(websocket) {
-    this.connections.delete(websocket);
-    this.logger.warn(`Web端已断开 | 在线: ${this.connections.size}`);
-    this.messageQueues.forEach(queue => queue.close()); this.messageQueues.clear();
-    this.emit('connectionRemoved', websocket);
-  }
-
-  _handleIncomingMessage(messageData) {
-    try {
-      const parsedMessage = JSON.parse(messageData); const requestId = parsedMessage.request_id;
-      if (!requestId) { return; }
-      const queue = this.messageQueues.get(requestId);
-      if (queue) { this._routeMessage(parsedMessage, queue); }
-    } catch (error) { this.logger.error('WS消息解析失败'); }
-  }
-
-  _routeMessage(message, queue) {
-    const { event_type } = message;
-    switch (event_type) {
-      case 'response_headers': case 'chunk': case 'error': queue.enqueue(message); break;
-      case 'stream_close': queue.enqueue({ type: 'STREAM_END' }); break;
-      default: break; 
-    }
-  }
-
-  hasActiveConnections() { return this.connections.size > 0; }
-  getFirstConnection() { return this.connections.values().next().value; }
-  createMessageQueue(requestId) { const queue = new MessageQueue(); this.messageQueues.set(requestId, queue); return queue; }
-  removeMessageQueue(requestId) { const queue = this.messageQueues.get(requestId); if (queue) { queue.close(); this.messageQueues.delete(requestId); } }
-}
-
-// ==========================================
-// 请求处理器 (核心逻辑 - 已修复)
-// ==========================================
-
 class RequestHandler {
-  constructor(connectionRegistry, logger) {
-    this.connectionRegistry = connectionRegistry;
-    this.logger = logger;
-  }
+  constructor(registry, logger) { this.registry = registry; this.logger = logger; }
 
   async processRequest(req, res) {
-    const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    this.logger.req(req.method, req.path, clientIP);
-
-    if (!this.connectionRegistry.hasActiveConnections()) {
-      return this._sendErrorResponse(res, 503, 'Tracy Error: 没有可用的Web端连接，请检查浏览器是否已连接WS。');
+    if (!this.registry.hasActiveConnections()) {
+      return res.status(503).json({ error: { message: "Tracy 网页端未连接" } });
     }
 
-    const requestId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-    const proxyRequest = this._buildProxyRequest(req, requestId);
-    const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
+    // 💎 1. 真实模型透传：完全保留 Chatbox 传来的模型路径
+    // 即使你填 gemini-2.5-pro (虽然官方没这号，可能是1.5或2.0)，这里也原样转发，绝不修改。
+    const targetPath = req.path;
+    
+    // 生成请求ID
+    const requestId = `${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    
+    // 构建清洗后的请求
+    const proxyReq = this._buildProxyRequest(req, requestId, targetPath);
+    const queue = this.registry.createMessageQueue(requestId);
     
     try {
-      await this._forwardRequest(proxyRequest);
-      await this._handleResponse(messageQueue, res, req);
-    } catch (error) {
-      this._handleRequestError(error, res);
-    } finally {
-      this.connectionRegistry.removeMessageQueue(requestId);
-    }
-  }
-
-  // 🛡️ 修复1：强行注入安全设置 (BLOCK_NONE)
-  _buildProxyRequest(req, requestId) {
-    let requestBody = '';
-    if (req.body && Object.keys(req.body).length > 0) {
-      let bodyObject;
-      try {
-        bodyObject = typeof req.body === 'object' && !Buffer.isBuffer(req.body)
-          ? { ...req.body }
-          : JSON.parse(req.body.toString());
-
-        // 注入安全设置，防止 400 错误
-        bodyObject.safetySettings = [
-            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
-        ];
-
-        if (bodyObject.hasOwnProperty('stream')) { delete bodyObject.stream; }
-        requestBody = JSON.stringify(bodyObject);
-      } catch (e) {
-        requestBody = Buffer.isBuffer(req.body) ? req.body.toString() : String(req.body);
-      }
-    }
-    return {
-      path: req.path, method: req.method, headers: req.headers,
-      query_params: req.query, body: requestBody, request_id: requestId
-    };
-  }
-
-  async _forwardRequest(proxyRequest) {
-    const connection = this.connectionRegistry.getFirstConnection();
-    connection.send(JSON.stringify(proxyRequest));
-  }
-
-  // 🛡️ 修复2：改进流式检测逻辑，防止 100秒超时
-  async _handleResponse(messageQueue, res, req) {
-    const headerMessage = await messageQueue.dequeue();
-
-    if (headerMessage.event_type === 'error') {
-      return this._sendErrorResponse(res, headerMessage.status || 500, headerMessage.message);
-    }
-
-    let isStreaming = false;
-    try {
-      // 检测1: 检查 Body 里的 stream 参数
-      if (req.body) {
-        const body = typeof req.body === 'object' ? req.body : JSON.parse(req.body.toString());
-        isStreaming = body.stream === true;
-      }
-      // 检测2: 检查 URL 路径里是否包含 stream (针对 Gemini 协议)
-      if (!isStreaming) {
-        isStreaming = req.path.toLowerCase().includes('stream');
-      }
-    } catch (e) { 
-        // 兜底: 如果解析失败，看路径就行
-        isStreaming = req.path.toLowerCase().includes('stream');
-    }
-
-    if (isStreaming) {
-      this.logger.info(`模式: ${C.CYAN}流式(Stream)${C.RESET} | 路径: ${req.path}`);
-      this._setResponseHeaders(res, headerMessage);
-      await this._streamResponseData(messageQueue, res);
-    } else {
-      this.logger.info(`模式: ${C.YELLOW}缓冲(Buffer)${C.RESET} | 路径: ${req.path}`);
-      await this._aggregateAndSendResponse(messageQueue, res, req);
-    }
-  }
-
-  _setResponseHeaders(res, headerMessage) {
-    res.status(headerMessage.status || 200);
-    const headers = headerMessage.headers || {};
-    Object.entries(headers).forEach(([name, value]) => {
-      if (!['transfer-encoding', 'content-length'].includes(name.toLowerCase())) {
-        res.set(name, value);
-      }
-    });
-  }
-
-  async _streamResponseData(messageQueue, res) {
-    // 强制设置流式头，防止客户端不认
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
-    while (true) {
-      try {
-        const dataMessage = await messageQueue.dequeue();
-        if (dataMessage.type === 'STREAM_END') break;
-        if (dataMessage.data) res.write(dataMessage.data);
-      } catch (error) {
-        if (error.message === 'Queue timeout') {
-            res.write(': keepalive\n\n');
-        } else { throw error; }
-      }
-    }
-    res.end();
-  }
-
-  _mapFinishReason(geminiReason) {
-    if (!geminiReason) return null;
-    switch (geminiReason) {
-      case "STOP": return "stop";
-      case "MAX_TOKENS": return "length";
-      case "SAFETY": case "RECITATION": return "content_filter";
-      default: return null;
-    }
-  }
-
-  _transformGeminiToOpenAI(geminiResponse) {
-    const candidates = geminiResponse.candidates || [];
-    const choices = candidates.map((candidate, index) => {
-      let role = candidate.content?.role === "model" ? "assistant" : (candidate.content?.role || "assistant");
-      const content = (candidate.content?.parts || []).map(part => part.text || "").join("");
-
-      return {
-        index: candidate.index ?? index,
-        message: { role: role, content: content },
-        finish_reason: this._mapFinishReason(candidate.finishReason),
-        logprobs: null 
-      };
-    });
-
-    let usage = null;
-    if (geminiResponse.usageMetadata) {
-      usage = {
-        prompt_tokens: geminiResponse.usageMetadata.promptTokenCount || 0,
-        completion_tokens: geminiResponse.usageMetadata.candidatesTokenCount || 0,
-        total_tokens: geminiResponse.usageMetadata.totalTokenCount || 0
-      };
-    }
-
-    const responseData = {
-      id: `chatcmpl-${Date.now()}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: "gemini-3-pro-preview",
-      choices: choices
-    };
-    if (usage) responseData.usage = usage;
-    return responseData;
-  }
-
-  async _aggregateAndSendResponse(messageQueue, res, req) {
-    const bodyParts = [];
-    while (true) {
-      try {
-        const dataMessage = await messageQueue.dequeue();
-        if (dataMessage.type === 'STREAM_END') break;
-        if (dataMessage.data) bodyParts.push(dataMessage.data);
-      } catch (error) { throw error; }
-    }
-    
-    const fullBody = bodyParts.join('');
-    try {
-      if (req.path.includes('/chat/completions')) {
-        const geminiJson = JSON.parse(fullBody);
-        const openaiJson = this._transformGeminiToOpenAI(geminiJson);
-        res.json(openaiJson);
-      } else {
-        res.set('Content-Type', 'application/json');
-        res.send(fullBody);
-      }
+      this.registry.getFirstConnection().send(JSON.stringify(proxyReq));
+      await this._handleResponse(queue, res, req);
     } catch (e) {
-      res.send(fullBody);
+      if(!res.headersSent) res.status(500).json({ error: { message: e.message } });
+    } finally {
+      this.registry.removeMessageQueue(requestId);
     }
   }
 
-  _handleRequestError(error, res) {
-    if (!res.headersSent) {
-      if (error.message === 'Queue timeout') {
-        this._sendErrorResponse(res, 504, '请求超时');
-      } else {
-        this._sendErrorResponse(res, 500, `代理错误: ${error.message}`);
-      }
-    } else { res.end(); }
-  }
-
-  _sendErrorResponse(res, status, message) {
-    if (!res.headersSent) { res.status(status).send({ error: { message, type: 'tracy_server_error' } }); }
-  }
-}
-
-// ==========================================
-// 主系统类
-// ==========================================
-class ProxyServerSystem extends EventEmitter {
-  constructor(config = {}) {
-    super(); 
-    this.config = { httpPort: 8889, wsPort: 9998, host: '0.0.0.0', ...config };
-    this.logger = new LoggingService(); 
-    this.connectionRegistry = new ConnectionRegistry(this.logger);
-    this.requestHandler = new RequestHandler(this.connectionRegistry, this.logger);
-  }
-  
-  async start() {
-    drawBanner(this.config.httpPort, this.config.wsPort);
-    try {
-      await this._startHttpServer(); 
-      await this._startWebSocketServer();
-      this.logger.info(`${C.GREEN}Tracy Server 启动成功，等待连接...${C.RESET}`);
-    } catch (error) { 
-      this.logger.error(`启动失败: ${error.message}`); 
-      process.exit(1); 
+  _buildProxyRequest(req, requestId, targetPath) {
+    let bodyObj = {};
+    if (req.body) {
+        try {
+            bodyObj = typeof req.body === 'object' ? req.body : JSON.parse(req.body.toString());
+        } catch (e) {}
     }
-  }
 
-  async _startHttpServer() {
-    const app = express();
-    app.use((req, res, next) => {
-      res.header('Access-Control-Allow-Origin', '*');
-      res.header('Access-Control-Allow-Methods', '*');
-      res.header('Access-Control-Allow-Headers', '*');
-      if (req.method === 'OPTIONS') return res.sendStatus(200);
-      next();
-    });
+    // ======================================================
+    // 🧹 深度清洗区 (Fix 400 Root Cause)
+    // ======================================================
 
-    app.use(express.json({ limit: '100mb' })); 
-    app.use(express.urlencoded({ extended: true, limit: '100mb' }));
-    app.use(express.raw({ limit: '100mb', type: '*/*' }));
+    // 1. 🚫 剔除 Tools (Chatbox 工具箱/联网搜索)
+    // 这是导致 Gemini 3 Pro 报错 400 的核心原因
+    if (bodyObj.tools) {
+        console.log(`${C.YELLOW}⚠️ 检测到 Tools/联网参数，已剔除以防止 400 报错${C.RESET}`);
+        delete bodyObj.tools;
+    }
+
+    // 2. 🔪 剔除 SafetySettings
+    // 防止因权限不足导致的 400
+    if (bodyObj.safetySettings) {
+        delete bodyObj.safetySettings;
+    }
     
-    // 模型列表接口 (Mock)
-    const modelsHandler = (req, res) => { 
-      res.json({ "models": [{ "name": "gemini-3-pro-preview", "displayName": "gemini-3-pro-preview", "version": "Tracy" }] }); 
+    // 3. 🧹 清理 generationConfig 中的杂项
+    // 有时候 Chatbox 会传一些旧参数
+    if (bodyObj.generationConfig) {
+        // 如果这里面有不支持的参数也可以在这里删
+        // delete bodyObj.generationConfig; // 暂时保留，通常只清理 tools 就够了
+    }
+
+    return { 
+        path: targetPath, 
+        method: req.method, 
+        headers: req.headers, 
+        query_params: req.query, 
+        body: JSON.stringify(bodyObj), 
+        request_id: requestId 
     };
-    app.get('/v1beta/models', modelsHandler); 
-    app.get('/models', modelsHandler);
-    
-    app.all(/(.*)/, (req, res) => this.requestHandler.processRequest(req, res));
-    
-    this.httpServer = http.createServer(app);
-    return new Promise((resolve) => this.httpServer.listen(this.config.httpPort, this.config.host, resolve));
   }
 
-  async _startWebSocketServer() {
-    this.wsServer = new WebSocket.Server({ port: this.config.wsPort, host: this.config.host });
-    this.wsServer.on('connection', (ws, req) => { 
-      this.connectionRegistry.addConnection(ws, { address: req.socket.remoteAddress }); 
+  // ... (下方的 WebSocket 处理逻辑保持最稳的 Build 1.5 版本) ...
+  
+  async _handleResponse(queue, res, req) {
+    const head = await queue.dequeue();
+    if (head.event_type === 'error') return res.status(head.status||500).json({error:{message:head.message}});
+
+    res.status(head.status || 200);
+    Object.entries(head.headers || {}).forEach(([k, v]) => {
+      if (!['content-length', 'transfer-encoding'].includes(k.toLowerCase())) res.set(k, v);
     });
+
+    if (head.headers && head.headers['content-type'] && head.headers['content-type'].includes('event-stream')) {
+        while(true) {
+            const msg = await queue.dequeue();
+            if (msg.type === 'STREAM_END') break;
+            if (msg.data) res.write(msg.data);
+        }
+        res.end();
+    } else {
+        const parts = [];
+        while(true) {
+            const msg = await queue.dequeue();
+            if (msg.type === 'STREAM_END') break;
+            if (msg.data) parts.push(msg.data);
+        }
+        const full = parts.join('');
+        if (req.path.includes('/chat/completions')) {
+            try { res.json(this._toOpenAI(JSON.parse(full))); } catch(e) { res.send(full); }
+        } else {
+            res.send(full);
+        }
+    }
+  }
+
+  _toOpenAI(g) {
+    return {
+        id: `chatcmpl-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now()/1000),
+        model: "gemini-pro-real",
+        choices: (g.candidates||[]).map((c,i)=>({
+            index: c.index??i,
+            message: { role: "assistant", content: (c.content?.parts||[]).map(p=>p.text).join("") },
+            finish_reason: "stop"
+        }))
+    };
   }
 }
 
-if (require.main === module) { 
-  new ProxyServerSystem().start(); 
+// ==========================================
+// 🔗 连接与系统
+// ==========================================
+class ConnectionRegistry {
+    constructor() { this.conns = new Set(); this.qs = new Map(); }
+    add(ws) { this.conns.add(ws); ws.on('message', d=>this.msg(d)); ws.on('close', ()=>this.conns.delete(ws)); }
+    msg(d) { try{const m=JSON.parse(d); if(m.request_id && this.qs.has(m.request_id)) this.qs.get(m.request_id).enqueue(m);}catch(e){} }
+    createMessageQueue(id) { const q = new MessageQueue(); this.qs.set(id, q); return q; }
+    removeMessageQueue(id) { if(this.qs.has(id)) { this.qs.get(id).close(); this.qs.delete(id); } }
+    hasActiveConnections() { return this.conns.size > 0; }
+    getFirstConnection() { return this.conns.values().next().value; }
 }
-module.exports = { ProxyServerSystem };
+
+class MessageQueue {
+    constructor() { this.q=[]; this.w=[]; this.closed=false; }
+    enqueue(m) { if(this.w.length) this.w.shift()(m); else this.q.push(m); }
+    dequeue() { return new Promise((r,j)=> { if(this.q.length) r(this.q.shift()); else this.w.push(r); }); }
+    close() { this.closed=true; }
+}
+
+const app = express();
+app.use(express.json({limit:'50mb'})); 
+app.use(express.raw({type:'*/*', limit:'50mb'}));
+app.use((req,r,n)=>{r.set({'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'*'}); if(req.method==='OPTIONS')r.sendStatus(200);else n();});
+
+const logger = { log: console.log };
+const registry = new ConnectionRegistry();
+const handler = new RequestHandler(registry, logger);
+
+app.all('*', (req, res) => handler.processRequest(req, res));
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ port: 9998 }); 
+wss.on('connection', ws => registry.add(ws));
+
+server.listen(8889, () => drawBanner(8889, 9998));
