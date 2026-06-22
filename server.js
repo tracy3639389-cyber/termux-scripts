@@ -3,6 +3,8 @@ const WebSocket = require('ws');
 const http = require('http');
 const { EventEmitter } = require('events');
 
+const SERVER_VERSION = '2.2';
+
 // ═══════════════════════════════════════════════════════════════
 // 🎨 ANSI 颜色常量 - 亮紫色主题
 // ═══════════════════════════════════════════════════════════════
@@ -138,22 +140,54 @@ class ConnectionRegistry extends EventEmitter {
     this.logger = logger;
     this.connections = new Set();
     this.messageQueues = new Map();
+    this.heartbeatIntervalMs = 30000;
+    this.maxMissedPongs = 4;
 
-    // 💓 每 30 秒向网页端发送原生 Ping 帧探测存活
+    // 💓 定期发送应用层 heartbeat，并用原生 Ping 帧探测存活
     this.pingTimer = setInterval(() => {
       this.connections.forEach(ws => {
-        if (ws.isAlive === false) {
-          this.logger.warn('💀 网页端心跳无响应，强制断开僵尸连接');
-          return ws.terminate();
+        if (ws.readyState !== WebSocket.OPEN) return;
+
+        if (ws.awaitingPong) {
+          ws.missedPongs = (ws.missedPongs || 0) + 1;
+          this.logger.warn(`⚠️ 网页端 Pong 延迟/丢失 ${ws.missedPongs}/${this.maxMissedPongs}`);
+
+          if (ws.missedPongs >= this.maxMissedPongs) {
+            this.logger.warn('💀 网页端连续心跳无响应，强制断开僵尸连接');
+            return ws.terminate();
+          }
         }
-        ws.isAlive = false;
-        ws.ping();
+
+        ws.awaitingPong = true;
+        this._sendAppHeartbeat(ws);
+        try {
+          ws.ping();
+        } catch (err) {
+          const msg = err && err.message ? err.message : String(err);
+          this.logger.warn(`WS native ping failed: ${msg}`);
+        }
       });
-    }, 30000);
+    }, this.heartbeatIntervalMs);
+  }
+
+  _sendAppHeartbeat(ws) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      ws.send(JSON.stringify({
+        event_type: 'heartbeat',
+        ts: Date.now(),
+      }));
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      this.logger.warn(`WS app heartbeat send failed: ${msg}`);
+    }
   }
 
   addConnection(ws, info) {
     ws.isAlive = true;
+    ws.awaitingPong = false;
+    ws.missedPongs = 0;
     this.connections.add(ws);
 
     this.logger.info(
@@ -161,9 +195,14 @@ class ConnectionRegistry extends EventEmitter {
       `活跃连接: ${C.purple}${C.bold}${this.connections.size}${C.reset}`
     );
 
-    ws.on('pong', () => { ws.isAlive = true; });
-    ws.on('message', (data) => this._onMessage(data.toString()));
+    ws.on('pong', () => {
+      ws.isAlive = true;
+      ws.awaitingPong = false;
+      ws.missedPongs = 0;
+    });
+    ws.on('message', (data) => this._onMessage(ws, data.toString()));
     ws.on('close', () => this._removeConnection(ws));
+    this._sendAppHeartbeat(ws);
     ws.on('error', (err) => this.logger.error(`🚨 WebSocket 异常: ${err.message}`));
   }
 
@@ -182,8 +221,11 @@ class ConnectionRegistry extends EventEmitter {
     }
   }
 
-  _onMessage(raw) {
+  _onMessage(ws, raw) {
     try {
+      ws.isAlive = true;
+      ws.awaitingPong = false;
+      ws.missedPongs = 0;
       const msg = JSON.parse(raw);
 
       // 忽略应用层心跳包，不触发任何队列操作
@@ -281,30 +323,53 @@ class RequestHandler {
       return res.status(204).end();
     }
 
-    const isStream = this._isStream(req);
+    const protocol = this._detectProtocol(req);
+    const isStream = this._isStream(req, protocol);
     const reqId = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const startTime = Date.now();
 
     this.logger.info(
       `📨 ${C.bold}${req.method}${C.reset} ${req.path} ` +
-      `[${isStream ? `${C.purple}流式${C.reset}` : `${C.lightPurple}非流式${C.reset}`}]`
+      `[${protocol === 'openai' ? `${C.cyan}OpenAI${C.reset}` : `${C.yellow}Gemini${C.reset}`} · ` +
+      `${isStream ? `${C.purple}流式${C.reset}` : `${C.lightPurple}非流式${C.reset}`}]`
     );
 
     if (!this.registry.hasActiveConnections()) {
       this.logger.warn('⚠️ 没有可用的 Tracy 网页端连接');
+      if (protocol === 'openai') {
+        return res.status(503).json({
+          error: {
+            message: '没有连接到 Tracy 网页端，请先打开并连接',
+            type: 'server_error',
+            code: 'UNAVAILABLE'
+          }
+        });
+      }
+
       return res.status(503).json({
         error: { message: '没有连接到 Tracy 网页端，请先打开并连接', status: 'UNAVAILABLE' }
       });
     }
 
     const queue = this.registry.createQueue(reqId);
-    const ctx = { tokens: { prompt: 0, candidates: 0, total: 0 } };
+    const ctx = {
+      tokens: { prompt: 0, candidates: 0, total: 0 },
+      protocol,
+      reqId,
+      model: this._getRequestedModel(req, protocol)
+    };
 
     try {
-      const proxyReq = this._buildProxyRequest(req, reqId);
+      const proxyReq = protocol === 'openai'
+        ? this._buildOpenAIProxyRequest(req, reqId, isStream)
+        : this._buildProxyRequest(req, reqId);
       this.registry.getFirstConnection().send(JSON.stringify(proxyReq));
 
-      if (isStream) {
+      if (protocol === 'openai' && isStream) {
+        await this._handleOpenAIStream(queue, res, ctx);
+      } else if (protocol === 'openai') {
+        await this._handleOpenAINonStream(queue, res, ctx);
+      } else if (isStream) {
         await this._handleStream(queue, res, ctx);
       } else {
         await this._handleNonStream(queue, res, ctx);
@@ -320,7 +385,7 @@ class RequestHandler {
       const dur = Date.now() - startTime;
       const tkStr = ctx.tokens.total > 0 ? ` ${this._fmtTokens(ctx.tokens)}` : '';
 
-      this._handleError(err, res);
+      this._handleError(err, res, protocol);
       this.logger.error(
         `❌ 失败 ${C.red}${dur}ms${C.reset}${tkStr} ${req.path}: ${err.message}`
       );
@@ -330,14 +395,131 @@ class RequestHandler {
   }
 
   // ── 流式请求检测 ──────────────────────────────────────
-  _isStream(req) {
+  _detectProtocol(req) {
+    const p = req.path || '';
+    if (
+      p === '/v1/chat/completions' ||
+      p === '/chat/completions' ||
+      p === '/v1/completions' ||
+      p === '/completions'
+    ) {
+      return 'openai';
+    }
+    return 'gemini';
+  }
+
+  _isStream(req, protocol = this._detectProtocol(req)) {
+    if (protocol === 'openai') {
+      return req.body && req.body.stream === true;
+    }
+
     // 1. Gemini REST API 标志: alt=sse
     if (req.query && req.query.alt === 'sse') return true;
-    // 2. OpenAI 兼容标志: body.stream
-    if (req.body && req.body.stream === true) return true;
-    // 3. 路径关键字
+    // 2. 路径关键字
     const p = req.path || '';
     return p.includes('streamGenerateContent') || p.includes('streamPredict');
+  }
+
+  _getRequestedModel(req, protocol) {
+    if (protocol === 'openai' && req.body && req.body.model) {
+      return String(req.body.model);
+    }
+
+    const match = (req.path || '').match(/\/models\/([^/:?]+)/);
+    return match ? decodeURIComponent(match[1]) : 'gemini-3.1-pro-preview';
+  }
+
+  _normalizeGeminiModel(model) {
+    const clean = String(model || '').replace(/^models\//, '');
+    if (clean.startsWith('gemini-')) return clean;
+    return 'gemini-3.1-pro-preview';
+  }
+
+  _extractOpenAIText(content) {
+    if (content === null || content === undefined) return '';
+    if (typeof content === 'string') return content;
+
+    if (Array.isArray(content)) {
+      return content.map(part => {
+        if (typeof part === 'string') return part;
+        if (!part || typeof part !== 'object') return '';
+        if (part.type === 'text') return part.text || '';
+        if (part.type === 'image_url') return `[image: ${part.image_url?.url || 'attached'}]`;
+        if (part.text) return part.text;
+        return '';
+      }).filter(Boolean).join('\n');
+    }
+
+    if (typeof content === 'object') {
+      if (content.text) return String(content.text);
+      return JSON.stringify(content);
+    }
+
+    return String(content);
+  }
+
+  _openAIToGeminiBody(body) {
+    const messages = Array.isArray(body.messages)
+      ? body.messages
+      : [{ role: 'user', content: body.prompt || '' }];
+
+    const systemParts = [];
+    const contents = [];
+
+    messages.forEach(msg => {
+      if (!msg || typeof msg !== 'object') return;
+      const role = msg.role || 'user';
+      const text = this._extractOpenAIText(msg.content);
+      if (!text) return;
+
+      if (role === 'system' || role === 'developer') {
+        systemParts.push({ text });
+        return;
+      }
+
+      contents.push({
+        role: role === 'assistant' ? 'model' : 'user',
+        parts: [{ text }]
+      });
+    });
+
+    if (contents.length === 0) {
+      contents.push({ role: 'user', parts: [{ text: '' }] });
+    }
+
+    const generationConfig = {};
+    if (body.temperature !== undefined) generationConfig.temperature = body.temperature;
+    if (body.top_p !== undefined) generationConfig.topP = body.top_p;
+    if (body.max_tokens !== undefined) generationConfig.maxOutputTokens = body.max_tokens;
+    if (body.max_completion_tokens !== undefined) generationConfig.maxOutputTokens = body.max_completion_tokens;
+    if (body.stop !== undefined) {
+      generationConfig.stopSequences = Array.isArray(body.stop) ? body.stop : [body.stop];
+    }
+
+    const geminiBody = { contents };
+    if (systemParts.length > 0) {
+      geminiBody.systemInstruction = { parts: systemParts };
+    }
+    if (Object.keys(generationConfig).length > 0) {
+      geminiBody.generationConfig = generationConfig;
+    }
+
+    return geminiBody;
+  }
+
+  _buildOpenAIProxyRequest(req, reqId, isStream) {
+    const model = this._normalizeGeminiModel(this._getRequestedModel(req, 'openai'));
+    const action = isStream ? 'streamGenerateContent' : 'generateContent';
+    const geminiBody = this._openAIToGeminiBody(req.body || {});
+
+    return {
+      path: `/v1beta/models/${encodeURIComponent(model)}:${action}`,
+      method: 'POST',
+      headers: req.headers,
+      query_params: isStream ? { alt: 'sse' } : {},
+      body: JSON.stringify(geminiBody),
+      request_id: reqId
+    };
   }
 
   _buildProxyRequest(req, reqId) {
@@ -360,6 +542,236 @@ class RequestHandler {
       body,
       request_id: reqId
     };
+  }
+
+  _geminiFinishToOpenAI(reason) {
+    const normalized = String(reason || '').toUpperCase();
+    if (normalized === 'MAX_TOKENS') return 'length';
+    if (normalized === 'SAFETY' || normalized === 'RECITATION') return 'content_filter';
+    if (!normalized) return null;
+    return 'stop';
+  }
+
+  _extractGeminiText(json) {
+    const candidates = Array.isArray(json?.candidates) ? json.candidates : [];
+    return candidates.map(candidate => {
+      const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+      return parts.map(part => {
+        if (part && typeof part.text === 'string') return part.text;
+        if (part && part.functionCall) return JSON.stringify(part.functionCall);
+        return '';
+      }).join('');
+    }).join('');
+  }
+
+  _openAIUsageFromGemini(json) {
+    const usage = json?.usageMetadata || {};
+    return {
+      prompt_tokens: usage.promptTokenCount || 0,
+      completion_tokens: usage.candidatesTokenCount || 0,
+      total_tokens: usage.totalTokenCount || 0
+    };
+  }
+
+  _openAICompletionPayload(ctx, geminiJson) {
+    const candidate = Array.isArray(geminiJson?.candidates) ? geminiJson.candidates[0] : null;
+    const content = this._extractGeminiText(geminiJson);
+
+    return {
+      id: `chatcmpl-${ctx.reqId}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: ctx.model,
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content
+        },
+        finish_reason: this._geminiFinishToOpenAI(candidate?.finishReason)
+      }],
+      usage: this._openAIUsageFromGemini(geminiJson)
+    };
+  }
+
+  _openAIChunkPayload(ctx, content, finishReason = null) {
+    const delta = {};
+    if (content) delta.content = content;
+
+    return {
+      id: `chatcmpl-${ctx.reqId}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: ctx.model,
+      choices: [{
+        index: 0,
+        delta,
+        finish_reason: finishReason
+      }]
+    };
+  }
+
+  _parseGeminiSSE(buffer, onJson) {
+    let pending = buffer;
+    let sepMatch;
+
+    while ((sepMatch = pending.match(/\r?\n\r?\n/))) {
+      const sepIndex = sepMatch.index;
+      const eventBlock = pending.slice(0, sepIndex);
+      pending = pending.slice(sepIndex + sepMatch[0].length);
+      const data = eventBlock
+        .split(/\r?\n/)
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).trimStart())
+        .join('\n')
+        .trim();
+
+      if (!data || data === '[DONE]') continue;
+      onJson(JSON.parse(data));
+    }
+
+    return pending;
+  }
+
+  async _handleOpenAINonStream(queue, res, ctx) {
+    const headerMsg = await queue.dequeue();
+    if (headerMsg.event_type === 'error') {
+      throw new ProxyError(
+        headerMsg.message || 'Upstream error',
+        headerMsg.status || 500
+      );
+    }
+
+    const chunks = [];
+
+    try {
+      while (true) {
+        const msg = await queue.dequeue(300000);
+        if (msg.type === 'STREAM_END') break;
+
+        if (msg.event_type === 'error') {
+          throw new ProxyError(
+            msg.message || 'Upstream error',
+            msg.status || 500
+          );
+        }
+
+        if (msg.data) {
+          chunks.push(typeof msg.data === 'string' ? msg.data : String(msg.data));
+        }
+      }
+    } catch (err) {
+      if (err instanceof ProxyError) throw err;
+      if (!(err.message === 'Queue timeout' && chunks.length > 0)) throw err;
+      this.logger.warn('⚠️ OpenAI 非流式响应超时，返回已收集的部分数据');
+    }
+
+    const body = chunks.join('');
+    const geminiJson = JSON.parse(body || '{}');
+    const extracted = this._extractTokens(body);
+    if (extracted.total > 0) {
+      ctx.tokens = this._mergeTokens(ctx.tokens, extracted);
+    }
+
+    res.status(headerMsg.status || 200);
+    res.set({
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-cache'
+    });
+    res.removeHeader('Transfer-Encoding');
+    res.json(this._openAICompletionPayload(ctx, geminiJson));
+  }
+
+  async _handleOpenAIStream(queue, res, ctx) {
+    const headerMsg = await queue.dequeue();
+    if (headerMsg.event_type === 'error') {
+      throw new ProxyError(
+        headerMsg.message || 'Upstream error',
+        headerMsg.status || 500
+      );
+    }
+
+    res.status(headerMsg.status || 200);
+    res.set({
+      'Content-Type':      'text/event-stream',
+      'Cache-Control':     'no-cache',
+      'Connection':        'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders();
+
+    let buffer = '';
+    let consecutiveTimeouts = 0;
+    const MAX_TIMEOUTS = 20;
+
+    const writeChunk = (geminiJson) => {
+      const text = this._extractGeminiText(geminiJson);
+      const candidate = Array.isArray(geminiJson?.candidates) ? geminiJson.candidates[0] : null;
+      const finishReason = this._geminiFinishToOpenAI(candidate?.finishReason);
+
+      const extracted = this._extractTokens(JSON.stringify(geminiJson));
+      if (extracted.total > 0) {
+        ctx.tokens = this._mergeTokens(ctx.tokens, extracted);
+      }
+
+      if (text) {
+        res.write(`data: ${JSON.stringify(this._openAIChunkPayload(ctx, text))}\n\n`);
+      }
+
+      if (finishReason) {
+        res.write(`data: ${JSON.stringify(this._openAIChunkPayload(ctx, '', finishReason))}\n\n`);
+      }
+    };
+
+    try {
+      while (true) {
+        try {
+          const msg = await queue.dequeue(15000);
+          if (msg.type === 'STREAM_END') break;
+
+          consecutiveTimeouts = 0;
+
+          if (msg.event_type === 'error') {
+            const errPayload = {
+              error: { message: msg.message, type: 'upstream_error', code: msg.status || 500 }
+            };
+            res.write(`data: ${JSON.stringify(errPayload)}\n\n`);
+            break;
+          }
+
+          if (msg.data) {
+            buffer += typeof msg.data === 'string' ? msg.data : String(msg.data);
+            buffer = this._parseGeminiSSE(buffer, writeChunk);
+          }
+        } catch (err) {
+          if (err.message === 'Queue timeout') {
+            consecutiveTimeouts++;
+            if (consecutiveTimeouts > MAX_TIMEOUTS) {
+              this.logger.warn('⚠️ OpenAI 流式响应长期无数据，安全终止连接');
+              break;
+            }
+            if (!res.writableEnded) res.write(': heartbeat\n\n');
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      const trailing = buffer.trim();
+      if (trailing) {
+        if (trailing.startsWith('data:')) {
+          this._parseGeminiSSE(`${buffer}\n\n`, writeChunk);
+        } else {
+          writeChunk(JSON.parse(trailing));
+        }
+      }
+
+      if (!res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+      }
+    } finally {
+      if (!res.writableEnded) res.end();
+    }
   }
 
   // ── 流式响应处理（同步心跳，不截断数据） ─────────────
@@ -513,28 +925,36 @@ class RequestHandler {
   }
 
   // ── 统一错误处理 ──────────────────────────────────────
-  _handleError(err, res) {
+  _handleError(err, res, protocol = 'gemini') {
     if (res.headersSent) {
       if (!res.writableEnded) res.end();
       return;
     }
 
+    const sendError = (status, message, code) => {
+      if (protocol === 'openai') {
+        return res.status(status).json({
+          error: {
+            message,
+            type: status >= 500 ? 'server_error' : 'invalid_request_error',
+            code
+          }
+        });
+      }
+
+      return res.status(status).json({
+        error: { message, status: code }
+      });
+    };
+
     if (err instanceof ProxyError) {
-      res.status(err.status).json({
-        error: { message: err.message, status: `HTTP_${err.status}` }
-      });
+      sendError(err.status, err.message, `HTTP_${err.status}`);
     } else if (err.message === 'Queue timeout') {
-      res.status(504).json({
-        error: { message: '请求超时，浏览器端未及时响应', status: 'TIMEOUT' }
-      });
+      sendError(504, '请求超时，浏览器端未及时响应', 'TIMEOUT');
     } else if (err.message === 'Queue closed') {
-      res.status(503).json({
-        error: { message: '浏览器连接已断开，请重试', status: 'UNAVAILABLE' }
-      });
+      sendError(503, '浏览器连接已断开，请重试', 'UNAVAILABLE');
     } else {
-      res.status(500).json({
-        error: { message: `代理内部错误: ${err.message}`, status: 'INTERNAL' }
-      });
+      sendError(500, `代理内部错误: ${err.message}`, 'INTERNAL');
     }
   }
 }
@@ -573,9 +993,17 @@ class ProxyServerSystem {
     });
 
     // 启动 WebSocket
-    this.wsServer = new WebSocket.Server({
-      port: this.config.wsPort,
-      host: this.config.host
+    await new Promise((resolve, reject) => {
+      this.wsServer = new WebSocket.Server({
+        port: this.config.wsPort,
+        host: this.config.host
+      });
+
+      this.wsServer.once('error', reject);
+      this.wsServer.once('listening', () => {
+        this.wsServer.removeListener('error', reject);
+        resolve();
+      });
     });
 
     this.wsServer.on('connection', (ws, req) => {
@@ -620,7 +1048,7 @@ class ProxyServerSystem {
         status: 'ok',
         connections: this.registry.connections.size,
         uptime: Math.floor(process.uptime()),
-        version: '2.1'
+        version: SERVER_VERSION
       });
     });
 
@@ -651,14 +1079,45 @@ class ProxyServerSystem {
         }
       ]
     };
+    const openAIModelsData = {
+      object: 'list',
+      data: modelsData.models.map(model => ({
+        id: model.name,
+        object: 'model',
+        created: 0,
+        owned_by: 'google'
+      }))
+    };
 
-    // 列表路由
-    app.get(['/v1beta/models', '/v1/models', '/models'], (req, res) => {
+    // OpenAI 兼容模型列表
+    app.get('/v1/models', (req, res) => {
+      res.json(openAIModelsData);
+    });
+
+    app.get('/v1/models/:model', (req, res) => {
+      const modelId = req.params.model;
+      const found = modelsData.models.find(m => m.name === modelId);
+      if (found) {
+        res.json({
+          id: found.name,
+          object: 'model',
+          created: 0,
+          owned_by: 'google'
+        });
+      } else {
+        res.status(404).json({
+          error: { message: `Model ${modelId} not found`, type: 'invalid_request_error', code: 'model_not_found' }
+        });
+      }
+    });
+
+    // Gemini 模型列表
+    app.get(['/v1beta/models', '/models'], (req, res) => {
       res.json(modelsData);
     });
 
-    // 单模型详情路由
-    app.get(['/v1beta/models/:model', '/v1/models/:model'], (req, res) => {
+    // Gemini 单模型详情路由
+    app.get('/v1beta/models/:model', (req, res) => {
       const modelId = req.params.model;
       const found = modelsData.models.find(m => m.name === modelId);
       if (found) {
@@ -688,12 +1147,36 @@ class ProxyServerSystem {
 
     const W = 44;
 
+    const charWidth = (ch) => {
+      const cp = ch.codePointAt(0);
+      if (
+        cp === 0 ||
+        cp === 0xfe0e ||
+        cp === 0xfe0f ||
+        (cp >= 0x0300 && cp <= 0x036f)
+      ) return 0;
+
+      if (
+        (cp >= 0x1100 && cp <= 0x115f) ||
+        (cp >= 0x2329 && cp <= 0x232a) ||
+        (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+        (cp >= 0xac00 && cp <= 0xd7a3) ||
+        (cp >= 0xf900 && cp <= 0xfaff) ||
+        (cp >= 0xfe10 && cp <= 0xfe19) ||
+        (cp >= 0xfe30 && cp <= 0xfe6f) ||
+        (cp >= 0xff00 && cp <= 0xff60) ||
+        (cp >= 0xffe0 && cp <= 0xffe6) ||
+        (cp >= 0x2600 && cp <= 0x27bf) ||
+        (cp >= 0x1f300 && cp <= 0x1faff)
+      ) return 2;
+
+      return 1;
+    };
+
     const visLen = (str) => {
       const stripped = str.replace(/\x1b\[[0-9;]*m/g, '');
       let len = 0;
-      for (const ch of stripped) {
-        len += ch.charCodeAt(0) > 127 ? 2 : 1;
-      }
+      for (const ch of stripped) len += charWidth(ch);
       return len;
     };
 
@@ -716,7 +1199,7 @@ class ProxyServerSystem {
     console.log(line);
     console.log(top);
     console.log(empty());
-    console.log(row(`${C.bold}${C.white}✨ Tracy Build 2.1 反代服务器 ✨${C.reset}`));
+    console.log(row(`${C.bold}${C.white}✨ Tracy Build ${SERVER_VERSION} 反代服务器 ✨${C.reset}`));
     console.log(row(`${pl}双向心跳保活 · 极速中转网关${C.reset}`));
     console.log(empty());
     console.log(sep);
